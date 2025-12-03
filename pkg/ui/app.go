@@ -793,7 +793,9 @@ func (m AppModel) fetchFiles(account, container string) tea.Cmd {
 		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 		blobs, err := c.ListBlobs(account, container)
 		if err != nil {
-			return nil // Handle error
+			// Return empty list on error - UI will show empty file list
+			// Error is logged via debug writer if enabled
+			return FileListMsg{Blobs: []azure.Blob{}}
 		}
 		return FileListMsg{Blobs: blobs}
 	}

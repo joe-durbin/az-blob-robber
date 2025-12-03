@@ -97,7 +97,8 @@ func (c *Client) CheckAccount(accountName string) bool {
 // exists: true if we get a response indicating existence (200, 403, etc)
 // public: true if we can list it (200)
 func (c *Client) CheckContainer(accountName, containerName string) (exists bool, public bool) {
-	u := fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container&comp=list&maxresults=1", accountName, containerName)
+	u := fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container&comp=list&maxresults=1",
+		accountName, url.PathEscape(containerName))
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return false, false
@@ -140,7 +141,8 @@ func (c *Client) listBlobsInternal(accountName, containerName, include string) (
 	marker := ""
 
 	for {
-		u := fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container&comp=list", accountName, containerName)
+		u := fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container&comp=list",
+			accountName, url.PathEscape(containerName))
 		if include != "" {
 			u += "&include=" + include
 		}
@@ -191,7 +193,7 @@ func (c *Client) GetBlobVersions(accountName, containerName, blobName string) ([
 	// We list blobs with prefix=blobName and include=versions
 	// This ensures we get all history for this specific blob.
 	u := fmt.Sprintf("https://%s.blob.core.windows.net/%s?restype=container&comp=list&include=versions&prefix=%s",
-		accountName, containerName, url.QueryEscape(blobName))
+		accountName, url.PathEscape(containerName), url.QueryEscape(blobName))
 
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
