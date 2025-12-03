@@ -1,3 +1,8 @@
-az-blob-robber
+# Compiled binary (root directory only)
+/az-blob-robber
+
+# Downloaded files
 downloads/
+
+# Debug log files
 debug_*.log
