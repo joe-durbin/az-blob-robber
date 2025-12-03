@@ -249,14 +249,27 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 
 					if versionStr != "" {
-						ext := filepath.Ext(item.Name)
-						base := item.Name[:len(item.Name)-len(ext)]
+						// Handle versioned filenames, preserving directory structure
+						cleanName := filepath.Clean(item.Name)
+						ext := filepath.Ext(cleanName)
+						base := cleanName
+						if ext != "" {
+							base = cleanName[:len(cleanName)-len(ext)]
+						}
 						t, err := time.Parse(time.RFC3339, versionStr)
 						if err == nil {
 							ts := t.Format("20060102150405")
-							filename = fmt.Sprintf("%s_%s%s", base, ts, ext)
+							if ext != "" {
+								filename = fmt.Sprintf("%s_%s%s", base, ts, ext)
+							} else {
+								filename = fmt.Sprintf("%s_%s", base, ts)
+							}
 						} else {
-							filename = fmt.Sprintf("%s_%s%s", base, versionStr, ext)
+							if ext != "" {
+								filename = fmt.Sprintf("%s_%s%s", base, versionStr, ext)
+							} else {
+								filename = fmt.Sprintf("%s_%s", base, versionStr)
+							}
 						}
 					}
 					path := filepath.Join("downloads", dateStr, m.selectedAccount, m.selectedContainer, filename)
@@ -822,18 +835,30 @@ func (m AppModel) downloadFile(blob azure.Blob, overwrite bool) tea.Cmd {
 		}
 
 		if versionStr != "" {
-			// Append version timestamp to filename
-			ext := filepath.Ext(blob.Name)
-			base := blob.Name[:len(blob.Name)-len(ext)]
+			// Append version timestamp to filename, preserving directory structure
+			// Use cleanName to ensure we're working with a safe path
+			ext := filepath.Ext(cleanName)
+			base := cleanName
+			if ext != "" {
+				base = cleanName[:len(cleanName)-len(ext)]
+			}
 
 			// Parse and reformat
 			t, err := time.Parse(time.RFC3339, versionStr)
 			if err == nil {
 				ts := t.Format("20060102150405")
-				path = filepath.Join(baseDir, fmt.Sprintf("%s_%s%s", base, ts, ext))
+				if ext != "" {
+					path = filepath.Join(baseDir, fmt.Sprintf("%s_%s%s", base, ts, ext))
+				} else {
+					path = filepath.Join(baseDir, fmt.Sprintf("%s_%s", base, ts))
+				}
 			} else {
 				// Fallback if parse fails
-				path = filepath.Join(baseDir, fmt.Sprintf("%s_%s%s", base, versionStr, ext))
+				if ext != "" {
+					path = filepath.Join(baseDir, fmt.Sprintf("%s_%s%s", base, versionStr, ext))
+				} else {
+					path = filepath.Join(baseDir, fmt.Sprintf("%s_%s", base, versionStr))
+				}
 			}
 		}
 

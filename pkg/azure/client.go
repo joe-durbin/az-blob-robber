@@ -231,25 +231,24 @@ func (c *Client) GetBlobVersions(accountName, containerName, blobName string) ([
 	return versions, nil
 }
 
-// GetBlobVersions fetches all versions of a specific blob.
-// In Azure Blob Storage, versions are listed in the main ListBlobs call if we include "versions".
-// So we can filter the already fetched list or re-fetch specifically for this blob if needed.
-// However, the standard way is to list the container with include=versions and filter by name.
-// For optimization, we might just rely on ListBlobs to get everything.
-// But if we want to "drill down", we can filter the cached list in the UI model.
-//
-// This function is kept for specific "download version" logic if needed.
+// DownloadBlob downloads a blob from Azure Storage.
+// accountName, containerName, and blobName are URL-encoded automatically.
+// snapshotOrVersion can be a version ID (RFC3339 format) or snapshot timestamp.
 func (c *Client) DownloadBlob(accountName, containerName, blobName, snapshotOrVersion string) (io.ReadCloser, error) {
-	u := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", accountName, containerName, blobName)
+	// URL encode path segments properly
+	u := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s",
+		accountName,
+		url.PathEscape(containerName),
+		url.PathEscape(blobName))
 
 	// Handle snapshots/versions
 	// Snapshots use ?snapshot=<timestamp>
 	// Versions use ?versionId=<timestamp>
+	// Version IDs are RFC3339 format (e.g., 2025-08-07T21:08:03.6678148Z)
+	// We detect version IDs by checking for the 'T' separator in ISO8601 format
 	if snapshotOrVersion != "" {
-		// Try to detect if it's a version ID (contains 'T' for timestamp format with time)
-		// Version IDs look like: 2025-08-07T21:08:03.6678148Z
-		// Snapshots look similar but are used differently
-		// For simplicity, we'll try versionId first (more common for versioning)
+		// Check if it looks like a version ID (RFC3339 format with 'T' separator)
+		// Version IDs typically have 'T' around position 10 (YYYY-MM-DDT...)
 		if len(snapshotOrVersion) > 10 && snapshotOrVersion[10] == 'T' {
 			u += "?versionId=" + url.QueryEscape(snapshotOrVersion)
 		} else {
