@@ -1,0 +1,7 @@
+mbtwebsite
+testaccount
+devstorage
+prodstorage
+storage
+backup
+
