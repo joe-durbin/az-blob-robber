@@ -56,6 +56,7 @@ type AppModel struct {
 	// Authentication
 	accessToken string
 	debugWriter io.Writer // Writer for debug output
+	userAgent   string
 
 	// Theme
 	currentTheme Theme
@@ -77,7 +78,7 @@ type AppModel struct {
 	scanTotal    int
 }
 
-func NewAppModel(scanner *scanner.Scanner, token string, debugWriter io.Writer) AppModel {
+func NewAppModel(scanner *scanner.Scanner, token string, debugWriter io.Writer, userAgent string) AppModel {
 	// Create lists
 	accountList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
 	accountList.Title = "Accounts & Containers"
@@ -115,6 +116,7 @@ func NewAppModel(scanner *scanner.Scanner, token string, debugWriter io.Writer) 
 		isScanning:   true,
 		accessToken:  token,
 		debugWriter:  debugWriter,
+		userAgent:    userAgent,
 		currentTheme: DefaultTheme,
 
 		isBulkDownloading: false,
@@ -775,7 +777,7 @@ type BulkDownloadProgressMsg struct {
 
 func (m AppModel) fetchFiles(account, container string) tea.Cmd {
 	return func() tea.Msg {
-		c := azure.NewClientWithToken(m.accessToken, m.debugWriter)
+		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 		blobs, err := c.ListBlobs(account, container)
 		if err != nil {
 			return nil // Handle error
@@ -792,7 +794,7 @@ type VersionsMsg struct {
 
 func (m AppModel) fetchVersions(account, container, blobName string) tea.Cmd {
 	return func() tea.Msg {
-		c := azure.NewClientWithToken(m.accessToken, m.debugWriter)
+		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 		versions, err := c.GetBlobVersions(account, container, blobName)
 		return VersionsMsg{BlobName: blobName, Versions: versions, Err: err}
 	}
@@ -800,7 +802,7 @@ func (m AppModel) fetchVersions(account, container, blobName string) tea.Cmd {
 
 func (m AppModel) downloadFile(blob azure.Blob, overwrite bool) tea.Cmd {
 	return func() tea.Msg {
-		c := azure.NewClientWithToken(m.accessToken, m.debugWriter)
+		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 
 		// Structure: downloads/date/account/container/file
 		dateStr := time.Now().Format("2006-01-02")
@@ -912,7 +914,7 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 
 	return func() tea.Msg {
 		// Download this file
-		c := azure.NewClientWithToken(m.accessToken, m.debugWriter)
+		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 
 		// Structure: downloads/date/account/container/file
 		dateStr := time.Now().Format("2006-01-02")

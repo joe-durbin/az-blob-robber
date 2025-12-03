@@ -15,11 +15,16 @@ type Client struct {
 	DebugWriter io.Writer // Writer for curl command logging (if nil, logging is disabled)
 }
 
+const DefaultUserAgent = "az-blob-robber/1.0"
+
 func NewClient() *Client {
-	return NewClientWithToken("", nil)
+	return NewClientWithToken("", nil, DefaultUserAgent)
 }
 
-func NewClientWithToken(token string, debugWriter io.Writer) *Client {
+func NewClientWithToken(token string, debugWriter io.Writer, userAgent string) *Client {
+	if userAgent == "" {
+		userAgent = DefaultUserAgent
+	}
 	return &Client{
 		httpClient: &http.Client{
 			// Timeout: 0, // No timeout for large downloads
@@ -28,7 +33,7 @@ func NewClientWithToken(token string, debugWriter io.Writer) *Client {
 				MaxIdleConnsPerHost: 100,
 			},
 		},
-		UserAgent:   "az-blob-robber/1.0",
+		UserAgent:   userAgent,
 		AccessToken: token,
 		DebugWriter: debugWriter,
 	}

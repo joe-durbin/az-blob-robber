@@ -52,7 +52,7 @@ go build -o az-blob-robber ./cmd/az-blob-robber
 
 ```bash
 # Target a specific account and container
-./az-blob-robber -a mywebsite -c '$web'
+./az-blob-robber -a mywebsite -c '$webroot'
 
 # Target specific account, scan all containers from wordlist
 ./az-blob-robber -a mycompany
@@ -65,7 +65,7 @@ go build -o az-blob-robber ./cmd/az-blob-robber
 
 ```bash
 # Use with Azure Storage access token
-./az-blob-robber -a mycompany -c finance-reports -t "eyJ0eXAi..."
+./az-blob-robber -a mycompany -c secret-reports -t "eyJ0eXAi..."
 ```
 
 ### Debug Mode
@@ -76,17 +76,27 @@ go build -o az-blob-robber ./cmd/az-blob-robber
 ./az-blob-robber -a myaccount --debug
 ```
 
+### Custom User-Agent
+
+```bash
+# Use a custom User-Agent string (default: az-blob-robber/1.0)
+./az-blob-robber -a myaccount -u "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+./az-blob-robber -b --user-agent "MyCustomAgent/1.0"
+```
+
+The User-Agent header is sent with all HTTP requests to Azure Storage. By default, it's set to `az-blob-robber/1.0`. You can customize it using the `-u` or `--user-agent` flag for testing purposes or to match specific client behavior.
+
 ### Screenshots
 
 **Brute-Force Discovery in Action**
 
-![Brute-force scanning](docs/screenshots/brute-force.png)
+SCREENSHOT COMING
 
 *Real-time discovery of storage accounts and containers during scanning*
 
 **Direct Targeting with Known Credentials**
 
-![Direct targeting](docs/screenshots/direct-target.png)
+SCREENSHOT COMING
 
 *Accessing a specific account and container when you already know the names*
 
@@ -94,19 +104,11 @@ go build -o az-blob-robber ./cmd/az-blob-robber
 
 ### Interface Layout
 
-```
-┌────────────────────────────────────────────────────┐
-│         az-blob-robber - Azure Storage Explorer    │
-├─────────────────┬──────────────────────────────────┤
-│ Accounts        │  Files                           │
-│                 │  🔄 VERSIONING ENABLED • 'v' ... │
-│ ▶ mywebsite     │                                  │
-│   └─ $web       │  🔄 index.html 12.5 KB           │
-│ ▶ mycompany     │  🗑️ scripts.zip (Deleted) 1.4 KB │
-│   └─ public     │  🔄 config.json 892 B            │
-└─────────────────┴──────────────────────────────────┘
-Found: 4 | Status: Done | Tab: Focus | 'q': Quit
-```
+SCREENSHOT COMING
+
+The interface consists of two main panes:
+- **Left Pane**: Displays discovered storage accounts and their containers in a hierarchical tree structure
+- **Right Pane**: Shows files within the selected container, with versioning indicators and file metadata
 
 ### Keyboard Shortcuts
 
@@ -117,7 +119,7 @@ Found: 4 | Status: Done | Tab: Focus | 'q': Quit
 | `d` | Download selected file |
 | `v` | Expand/collapse version history for selected file |
 | `b` | Bulk download all latest versions in container |
-| `t` | Toggle theme (Default ↔ Rose Pine) |
+| `t` | Toggle theme (cycles through all available themes) |
 | `Enter` | Confirm in dialogs |
 | `y/n` | Confirm/cancel overwrite prompts |
 | `q` or `Ctrl+C` | Quit application |
@@ -148,9 +150,9 @@ Files are saved to a structured directory:
 downloads/
 └── 2024-12-02/
     └── mywebsite/
-        └── $web/
+        └── $webroot/
             ├── index.html
-            └── scripts_20250807210803.zip
+            └── backup.zip
 ```
 
 - **Date-based structure**: `downloads/YYYY-MM-DD/account/container/`
@@ -181,6 +183,7 @@ Save the access token and pass it via the `-t` or `--token` flag:
 
 - Token is sent as `Authorization: Bearer <token>` header in all HTTP requests
 - Uses Azure Storage REST API version `2019-12-12`
+- User-Agent header is set to `az-blob-robber/1.0` by default (customizable via `-u`/`--user-agent`)
 - Works for discovery, listing, and downloading operations
 - Enables access to private containers and non-public storage accounts
 
@@ -204,7 +207,7 @@ When versioning is enabled on a storage account, you'll see:
    ```
 4. Navigate to a specific version and press `d` to download it
 
-![Version history](docs/screenshots/version-history.png)
+SCREENSHOT COMING
 
 *Expanded version history showing multiple snapshots of a file*
 
@@ -215,7 +218,7 @@ Files marked as deleted (🗑️) are:
 - Only visible when the storage account has versioning enabled
 - Downloadable if you have appropriate access
 
-![Deleted files](docs/screenshots/deleted-files.png)
+SCREENSHOT COMING
 
 *Deleted files are clearly marked with a trash icon and (Deleted) label*
 
@@ -258,11 +261,13 @@ Useful for:
 
 ## Themes
 
-Toggle between color schemes using the `t` key:
+Toggle between color schemes using the `t` key. The tool includes five built-in themes:
 
-**Default Theme** - Blue focused borders, classic terminal colors
-
-**Rose Pine Theme** - Soft pink focused borders, muted pastels inspired by [Rose Pine](https://rosepinetheme.com/)
+- **Default Theme** - Blue focused borders, classic terminal colors
+- **Rose Pine Theme** - Soft pink focused borders, muted pastels inspired by [Rose Pine](https://rosepinetheme.com/)
+- **Hacker Theme** - Classic green-on-black hacker aesthetic
+- **Catppuccin Theme** - Inspired by Catppuccin Mocha color palette
+- **Vibrant Theme** - Super colorful theme with vibrant accents
 
 Theme persists during the session and affects:
 - Border colors (focused/unfocused panes)
@@ -293,6 +298,24 @@ Customize these files or provide your own via `-A`/`--accounts` and `-C`/`--cont
 ```
 
 Higher concurrency speeds up discovery but may trigger rate limiting on some networks.
+
+### Custom User-Agent
+
+The tool sends a User-Agent header with all HTTP requests. By default, this is set to `az-blob-robber/1.0`. You can customize it using the `-u` or `--user-agent` flag:
+
+```bash
+# Use default User-Agent (az-blob-robber/1.0)
+./az-blob-robber -b
+
+# Use custom User-Agent
+./az-blob-robber -b -u "Mozilla/5.0 (compatible; MSIE 10.0)"
+./az-blob-robber -a myaccount --user-agent "MyCustomTool/2.0"
+```
+
+**Use cases:**
+- Testing how Azure Storage responds to different User-Agent strings
+- Mimicking specific client behavior for compatibility testing
+- Customizing identification for logging or monitoring purposes
 
 ## Architecture
 

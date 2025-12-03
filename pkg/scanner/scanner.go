@@ -32,9 +32,10 @@ type Scanner struct {
 	Concurrency    int
 	Token          string
 	DebugWriter    io.Writer
+	UserAgent      string
 }
 
-func NewScanner(accountNames, containerNames []string, concurrency int, token string, debugWriter io.Writer) *Scanner {
+func NewScanner(accountNames, containerNames []string, concurrency int, token string, debugWriter io.Writer, userAgent string) *Scanner {
 	return &Scanner{
 		AccountNames:   accountNames,
 		ContainerNames: containerNames,
@@ -42,6 +43,7 @@ func NewScanner(accountNames, containerNames []string, concurrency int, token st
 		Concurrency:    concurrency,
 		Token:          token,
 		DebugWriter:    debugWriter,
+		UserAgent:      userAgent,
 	}
 }
 
@@ -49,7 +51,7 @@ func (s *Scanner) Start() {
 	go func() {
 		defer close(s.Results)
 
-		client := azure.NewClientWithToken(s.Token, s.DebugWriter)
+		client := azure.NewClientWithToken(s.Token, s.DebugWriter, s.UserAgent)
 
 		// Calculate total combinations
 		total := len(s.AccountNames) * len(s.ContainerNames)
