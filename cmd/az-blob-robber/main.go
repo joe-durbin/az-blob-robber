@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/joe-durbin/az-blob-robber/pkg/azure"
@@ -23,7 +24,55 @@ Usage:
 
 Options:
 `, os.Args[0])
-		flag.PrintDefaults()
+		
+		// Collect flags and sort by custom order
+		type flagInfo struct {
+			flag *flag.Flag
+			order int
+		}
+		
+		var flags []flagInfo
+		order := map[string]int{
+			"brute-force-defaults": 1,
+			"account":              2,
+			"container":            3,
+			"accounts":              4,
+			"containers":            5,
+			"token":                 6,
+			"user-agent":            7,
+			"concurrency":           8,
+			"debug":                 9,
+		}
+		
+		flag.VisitAll(func(f *flag.Flag) {
+			flagOrder := order[f.Name]
+			if flagOrder == 0 {
+				flagOrder = 999 // Put undefined flags at the end
+			}
+			flags = append(flags, flagInfo{flag: f, order: flagOrder})
+		})
+		
+		// Sort by order
+		sort.Slice(flags, func(i, j int) bool {
+			return flags[i].order < flags[j].order
+		})
+		
+		// Print flags in sorted order
+		for _, fi := range flags {
+			f := fi.flag
+			usage := f.Usage
+			if f.DefValue != "" && f.DefValue != "false" {
+				usage += fmt.Sprintf(" (default: %q)", f.DefValue)
+			}
+			
+			if f.Shorthand != "" {
+				fmt.Fprintf(os.Stderr, "  -%s, --%s\n", f.Shorthand, f.Name)
+			} else {
+				fmt.Fprintf(os.Stderr, "      --%s\n", f.Name)
+			}
+			fmt.Fprintf(os.Stderr, "        %s\n", usage)
+		}
+		
 		fmt.Fprintf(os.Stderr, `
 Examples:
   # Show help
