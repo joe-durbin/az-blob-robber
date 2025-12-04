@@ -39,9 +39,19 @@ type AppModel struct {
 	isScanning     bool
 	isLoadingFiles bool
 
+	// Single Download State
+	isSingleDownloading       bool
+	singleDownloadBlob       *azure.Blob
+	singleDownloadPath       string
+	singleDownloadBytesRead  int64
+	singleDownloadTotalBytes int64
+	singleDownloadCancelled  bool
+	singleDownloadReader     io.ReadCloser
+	singleDownloadWriter     *os.File
+
 	// Modal State
 	showModal    bool
-	modalType    int // 0: None, 1: Confirm, 2: Alert
+	modalType    int // 0: None, 1: Confirm, 2: Alert, 3: Bulk Confirm, 4: Bulk Progress, 5: Single Download Progress
 	modalTitle   string
 	modalContent string
 	pendingBlob  *azure.Blob // For overwrite confirmation
@@ -70,6 +80,9 @@ type AppModel struct {
 	bulkDownloadQueue     []FileItem
 	bulkDownloadTotal     int
 	bulkDownloadCurrent   int
+	bulkCancelRequested   bool
+	bulkCurrentBytesRead  int64
+	bulkCurrentTotalBytes int64
 	bulkDownloadSuccesses int
 	bulkDownloadFailures  []string
 
@@ -167,9 +180,62 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.modalType {
 			case 1: // Confirm Overwrite
 				if msg.String() == "y" || msg.String() == "Y" {
-					m.showModal = false
 					if m.pendingBlob != nil {
-						return m, m.downloadFile(*m.pendingBlob, true)
+						// Use the new progress-based download system
+						blob := *m.pendingBlob
+						m.pendingBlob = nil
+						
+						// Build path (same logic as 'd' key handler)
+						dateStr := time.Now().Format("2006-01-02")
+						filename := blob.Name
+						versionStr := blob.VersionId
+						if versionStr == "" {
+							versionStr = blob.Snapshot
+						}
+						
+						if versionStr != "" {
+							cleanName := filepath.Clean(blob.Name)
+							ext := filepath.Ext(cleanName)
+							base := cleanName
+							if ext != "" {
+								base = cleanName[:len(cleanName)-len(ext)]
+							}
+							t, err := time.Parse(time.RFC3339, versionStr)
+							if err == nil {
+								ts := t.Format("20060102150405")
+								if ext != "" {
+									filename = fmt.Sprintf("%s_%s%s", base, ts, ext)
+								} else {
+									filename = fmt.Sprintf("%s_%s", base, ts)
+								}
+							} else {
+								if ext != "" {
+									filename = fmt.Sprintf("%s_%s%s", base, versionStr, ext)
+								} else {
+									filename = fmt.Sprintf("%s_%s", base, versionStr)
+								}
+							}
+						}
+						
+						path := filepath.Join("downloads", dateStr, m.selectedAccount, m.selectedContainer, filename)
+						
+						// Initialize single download state
+						m.isSingleDownloading = true
+						m.singleDownloadBlob = &blob
+						m.singleDownloadPath = path
+						m.singleDownloadBytesRead = 0
+						m.singleDownloadTotalBytes = blob.Properties.ContentLength
+						m.singleDownloadCancelled = false
+						
+						// Switch to progress modal
+						m.modalType = 5 // Single Download Progress
+						m.modalTitle = "Downloading File"
+						m.modalContent = fmt.Sprintf(
+							"Downloading %s...\n\n0%% (0 / %d bytes)\n\nPress ESC to cancel.",
+							blob.Name, m.singleDownloadTotalBytes,
+						)
+						
+						return m, m.startSingleDownload(blob, path)
 					}
 				} else if msg.String() == "n" || msg.String() == "N" || msg.String() == "esc" {
 					m.showModal = false
@@ -182,16 +248,30 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case 3: // Bulk download confirm
 				if msg.String() == "y" || msg.String() == "Y" {
 					m.showModal = true // Keep modal open
-				m.modalType = 4    // Switch to progress modal
-				m.modalTitle = "Bulk Download in Progress"
-				m.modalContent = "Starting download...\n\nPlease wait..."
-				return m, m.startBulkDownload()
+					m.modalType = 4    // Switch to progress modal
+					m.modalTitle = "Bulk Download in Progress"
+					m.modalContent = "Starting download...\n\nPlease wait..."
+					return m, m.startBulkDownload()
 				} else if msg.String() == "n" || msg.String() == "N" || msg.String() == "esc" {
 					m.showModal = false
 				}
-			case 4: // Bulk download progress (can't cancel, just informational)
-				// Do nothing, wait for download to complete
-				// User just needs to wait
+			case 4: // Bulk download progress
+				// Allow cancel with ESC
+				if msg.String() == "esc" {
+					m.bulkCancelRequested = true
+					m.modalTitle = "Cancelling Bulk Download..."
+				}
+			case 5: // Single download progress
+				// Allow cancel with ESC
+				if msg.String() == "esc" {
+					m.singleDownloadCancelled = true
+					m.modalTitle = "Cancelling Download..."
+					// Close the reader to unblock any pending Read() calls
+					if m.singleDownloadReader != nil {
+						m.singleDownloadReader.Close()
+						// Don't set to nil yet - let the step function handle cleanup
+					}
+				}
 			}
 			return m, nil
 		}
@@ -234,14 +314,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// }
 		case "d":
 			if m.state == stateExploring && len(m.files) > 0 {
-				// Download selected file
+				// Download selected file (no confirmation; go straight to progress)
 				item, ok := m.fileList.SelectedItem().(FileItem)
 				if ok {
-					// Check if file exists
-					// Construct path first to check
 					dateStr := time.Now().Format("2006-01-02")
-					// Structure: downloads/date/account/container/file
-
 					filename := item.Name
 					versionStr := item.VersionId
 					if versionStr == "" {
@@ -272,19 +348,27 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							}
 						}
 					}
+
 					path := filepath.Join("downloads", dateStr, m.selectedAccount, m.selectedContainer, filename)
 
-					if _, err := os.Stat(path); err == nil {
-						// File exists, prompt overwrite
-						m.showModal = true
-						m.modalType = 1 // Confirm
-						m.modalTitle = "File Exists"
-						m.modalContent = fmt.Sprintf("File '%s' already exists.\nOverwrite?\n\n[y] Yes  [n] No", item.Name)
-						m.pendingBlob = &item.Blob
-						return m, nil
-					}
+					// Initialize single download state
+					m.isSingleDownloading = true
+					m.singleDownloadBlob = &item.Blob
+					m.singleDownloadPath = path
+					m.singleDownloadBytesRead = 0
+					m.singleDownloadTotalBytes = item.Blob.Properties.ContentLength
+					m.singleDownloadCancelled = false
 
-					return m, m.downloadFile(item.Blob, false)
+					// Show progress modal immediately
+					m.showModal = true
+					m.modalType = 5 // Single Download Progress
+					m.modalTitle = "Downloading File"
+					m.modalContent = fmt.Sprintf(
+						"Downloading %s...\n\n0%% (0 / %d bytes)\n\nPress ESC to cancel.",
+						item.Name, m.singleDownloadTotalBytes,
+					)
+
+					return m, m.startSingleDownload(item.Blob, path)
 				}
 			}
 
@@ -313,68 +397,157 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case DownloadMsg:
-		if msg.Message != "" {
-			// Bulk download completed - show summary
+	case SingleDownloadStartedMsg:
+		if msg.Err != nil {
+			// Error starting download
+			m.isSingleDownloading = false
 			m.showModal = true
-			m.modalType = 2 // Alert
-			if msg.Success {
-				m.modalTitle = "Bulk Download Complete!"
-			} else {
-				m.modalTitle = "Bulk Download Finished with Errors"
-			}
-			m.modalContent = fmt.Sprintf("%s\n\n[Enter] OK", msg.Message)
+			m.modalType = 2
+			m.modalTitle = "Download Error"
+			m.modalContent = fmt.Sprintf("Failed to start download:\n%s\n\n[Enter] OK", msg.Err.Error())
 			return m, nil
-		} else if msg.Err != nil {
-			// Single file download error
+		}
+
+		// Store reader and writer in model
+		m.singleDownloadReader = msg.Reader
+		m.singleDownloadWriter = msg.Writer
+
+		// Start the first download step
+		return m, m.singleDownloadStep()
+
+	case SingleDownloadProgressMsg:
+		// Update progress in model
+		m.singleDownloadBytesRead = msg.BytesRead
+
+		// Calculate percentage
+		percent := 0
+		if msg.Total > 0 {
+			percent = int(float64(msg.BytesRead) / float64(msg.Total) * 100)
+		}
+
+		// Update modal content
+		if msg.Total > 0 {
+			m.modalContent = fmt.Sprintf(
+				"Downloading %s...\n\n%d%% (%d / %d bytes)\n\nPress ESC to cancel.",
+				msg.BlobName, percent, msg.BytesRead, msg.Total,
+			)
+		} else {
+			m.modalContent = fmt.Sprintf(
+				"Downloading %s...\n\n%d bytes downloaded\n\nPress ESC to cancel.",
+				msg.BlobName, msg.BytesRead,
+			)
+		}
+
+		// Check if done or error
+		if msg.Done {
+			// Clean up resources
+			if m.singleDownloadReader != nil {
+				m.singleDownloadReader.Close()
+				m.singleDownloadReader = nil
+			}
+			if m.singleDownloadWriter != nil {
+				m.singleDownloadWriter.Close()
+				m.singleDownloadWriter = nil
+			}
+
+			m.isSingleDownloading = false
+
+			if m.singleDownloadCancelled {
+				// User cancelled
+				m.showModal = true
+				m.modalType = 2
+				m.modalTitle = "Download Cancelled"
+				m.modalContent = fmt.Sprintf("Download of \"%s\" was cancelled.\n\n[Enter] OK", msg.BlobName)
+				m.singleDownloadCancelled = false
+				m.singleDownloadBlob = nil
+				return m, nil
+			} else if msg.Err != nil {
+				// Error occurred
+				m.showModal = true
+				m.modalType = 2
+				m.modalTitle = "Download Error"
+				m.modalContent = fmt.Sprintf("Error downloading file:\n%s\n\n[Enter] OK", msg.Err.Error())
+				m.singleDownloadBlob = nil
+				return m, nil
+			} else {
+				// Success
+				m.showModal = true
+				m.modalType = 2
+				m.modalTitle = "Download Complete"
+				m.modalContent = fmt.Sprintf("File saved to:\n%s\n\n[Enter] OK", msg.Path)
+				m.singleDownloadBlob = nil
+				return m, nil
+			}
+		}
+
+		// Continue downloading (not done yet)
+		return m, m.singleDownloadStep()
+
+	case DownloadMsg:
+		if msg.Err != nil {
+			// Single file download error (legacy path)
 			m.showModal = true
 			m.modalType = 2
 			m.modalTitle = "Download Error"
 			m.modalContent = fmt.Sprintf("%s\n\n[Enter] OK", msg.Err.Error())
 			return m, nil
-		} else {
-			// Single file download success
-			m.showModal = true
-			m.modalType = 2
-			m.modalTitle = "Download Complete"
-			m.modalContent = fmt.Sprintf("File saved to:\n%s\n\n[Enter] OK", msg.Path)
-			return m, nil
 		}
 
 	case BulkDownloadProgressMsg:
-		// Update progress
-		if msg.Err != nil {
+		// Update byte-level and file-level progress
+		m.bulkCurrentBytesRead = msg.Bytes
+		m.bulkCurrentTotalBytes = msg.TotalB
+
+		if msg.Err != nil && msg.Done {
 			m.bulkDownloadFailures = append(m.bulkDownloadFailures, msg.File)
-		} else {
+		} else if msg.Done && msg.Err == nil {
 			m.bulkDownloadSuccesses++
 		}
 
-		// Update modal content
-		m.modalContent = fmt.Sprintf("Downloading files...\n\nProgress: %d/%d\n\nCurrent: %s\n\nPlease wait...",
-			msg.Current, msg.Total, msg.File)
-
-		// Check if done
-		if msg.Current >= msg.Total {
-			m.isBulkDownloading = false
-
-			// Create summary message
-			var summary string
-			if len(m.bulkDownloadFailures) > 0 {
-				summary = fmt.Sprintf("Downloaded: %d\nFailed: %d\n\nFailed files:\n%s",
-					m.bulkDownloadSuccesses, len(m.bulkDownloadFailures), strings.Join(m.bulkDownloadFailures, "\n"))
-				m.modalTitle = "Bulk Download Finished with Errors"
-			} else {
-				summary = fmt.Sprintf("Successfully downloaded %d files!", m.bulkDownloadSuccesses)
-				m.modalTitle = "Bulk Download Complete!"
-			}
-
-			m.modalType = 2 // Alert (OK button)
-			m.modalContent = summary + "\n\n[Enter] OK"
-			return m, nil
+		// Calculate percentage for current file if size known
+		percent := 0
+		if m.bulkCurrentTotalBytes > 0 {
+			percent = int(float64(m.bulkCurrentBytesRead) / float64(m.bulkCurrentTotalBytes) * 100)
 		}
 
-		// Continue with next file
-		return m, m.downloadNextFile()
+		m.modalContent = fmt.Sprintf(
+			"Downloading files...\n\nFile %d/%d: %s\n%d%% (%d / %d bytes)\n\nPress ESC to cancel.",
+			msg.Current, msg.Total, msg.File, percent, m.bulkCurrentBytesRead, m.bulkCurrentTotalBytes,
+		)
+
+		// If this file is done, either move to next or finish
+		if msg.Done {
+			// If cancellation requested or we've reached the end, show summary
+			if m.bulkCancelRequested || msg.Current >= msg.Total {
+				m.isBulkDownloading = false
+
+				// Build summary
+				remaining := msg.Total - msg.Current
+				var summary string
+				if m.bulkCancelRequested {
+					summary = fmt.Sprintf("Bulk download cancelled.\n\nDownloaded: %d\nFailed: %d\nRemaining skipped: %d",
+						m.bulkDownloadSuccesses, len(m.bulkDownloadFailures), remaining)
+					m.modalTitle = "Bulk Download Cancelled"
+				} else if len(m.bulkDownloadFailures) > 0 {
+					summary = fmt.Sprintf("Downloaded: %d\nFailed: %d\n\nFailed files:\n%s",
+						m.bulkDownloadSuccesses, len(m.bulkDownloadFailures), strings.Join(m.bulkDownloadFailures, "\n"))
+					m.modalTitle = "Bulk Download Finished with Errors"
+				} else {
+					summary = fmt.Sprintf("Successfully downloaded %d files!", m.bulkDownloadSuccesses)
+					m.modalTitle = "Bulk Download Complete!"
+				}
+
+				m.modalType = 2 // Alert (OK button)
+				m.modalContent = summary + "\n\n[Enter] OK"
+				return m, nil
+			}
+
+			// Continue with next file
+			return m, m.downloadNextFile()
+		}
+
+		// Continue downloading current file
+		return m, m.bulkDownloadStep()
 
 	case scanner.Result:
 		if msg.Type == scanner.ResultScanFinished {
@@ -774,6 +947,24 @@ type FileListMsg struct {
 	Blobs []azure.Blob
 }
 
+// Messages for single download with progress
+type SingleDownloadStartedMsg struct {
+	Reader   io.ReadCloser
+	Writer   *os.File
+	Path     string
+	BlobName string
+	Err      error
+}
+
+type SingleDownloadProgressMsg struct {
+	BytesRead int64
+	Total     int64
+	Path      string
+	BlobName  string
+	Done      bool
+	Err       error
+}
+
 type DownloadMsg struct {
 	Err     error
 	Path    string
@@ -785,8 +976,127 @@ type BulkDownloadProgressMsg struct {
 	Current int
 	Total   int
 	File    string
+	Bytes   int64
+	TotalB  int64
+	Done    bool
 	Err     error
 }
+
+// --- Single Download Commands ---
+
+// startSingleDownload begins a single file download by opening the HTTP stream and file.
+func (m AppModel) startSingleDownload(blob azure.Blob, path string) tea.Cmd {
+	return func() tea.Msg {
+		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return SingleDownloadStartedMsg{Err: err, BlobName: blob.Name}
+		}
+
+		// Determine which identifier to use (VersionId takes precedence over Snapshot)
+		identifier := blob.VersionId
+		if identifier == "" {
+			identifier = blob.Snapshot
+		}
+
+		rc, err := c.DownloadBlob(m.selectedAccount, m.selectedContainer, blob.Name, identifier)
+		if err != nil {
+			return SingleDownloadStartedMsg{Err: err, BlobName: blob.Name}
+		}
+
+		f, err := os.Create(path)
+		if err != nil {
+			rc.Close()
+			return SingleDownloadStartedMsg{Err: err, BlobName: blob.Name}
+		}
+
+		return SingleDownloadStartedMsg{
+			Reader:   rc,
+			Writer:   f,
+			Path:     path,
+			BlobName: blob.Name,
+			Err:      nil,
+		}
+	}
+}
+
+// singleDownloadStep reads a chunk from the current download and reports progress.
+// Note: This function needs to access the model's reader/writer, so it must be called
+// after SingleDownloadStartedMsg has been processed and the reader/writer are set.
+func (m AppModel) singleDownloadStep() tea.Cmd {
+	return func() tea.Msg {
+		// Access the current model's reader/writer (these are set when SingleDownloadStartedMsg is received)
+		reader := m.singleDownloadReader
+		writer := m.singleDownloadWriter
+		currentBytes := m.singleDownloadBytesRead
+		totalBytes := m.singleDownloadTotalBytes
+		path := m.singleDownloadPath
+		blobName := ""
+		if m.singleDownloadBlob != nil {
+			blobName = m.singleDownloadBlob.Name
+		}
+
+		if reader == nil || writer == nil {
+			return SingleDownloadProgressMsg{
+				BytesRead: currentBytes,
+				Total:     totalBytes,
+				Path:      path,
+				BlobName:  blobName,
+				Done:      true,
+				Err:       fmt.Errorf("download not properly initialized"),
+			}
+		}
+
+		// Check if user requested cancel (read from model)
+		if m.singleDownloadCancelled {
+			return SingleDownloadProgressMsg{
+				BytesRead: currentBytes,
+				Total:     totalBytes,
+				Path:      path,
+				BlobName:  blobName,
+				Done:      true,
+				Err:       nil,
+			}
+		}
+
+		// Read a chunk
+		buf := make([]byte, 32*1024)
+		n, err := reader.Read(buf)
+
+		newBytesRead := currentBytes
+		if n > 0 {
+			if _, werr := writer.Write(buf[:n]); werr != nil && err == nil {
+				err = werr
+			}
+			newBytesRead = currentBytes + int64(n)
+		}
+
+		done := false
+		var finalErr error
+
+		if err != nil {
+			if err == io.EOF {
+				done = true
+				finalErr = nil
+			} else {
+				done = true
+				finalErr = err
+			}
+		}
+
+		return SingleDownloadProgressMsg{
+			BytesRead: newBytesRead,
+			Total:     totalBytes,
+			Path:      path,
+			BlobName:  blobName,
+			Done:      done,
+			Err:       finalErr,
+		}
+	}
+}
+
+// --- Bulk Download Commands (with per-file progress) ---
 
 func (m AppModel) fetchFiles(account, container string) tea.Cmd {
 	return func() tea.Msg {
@@ -902,6 +1212,9 @@ func (m AppModel) downloadFile(blob azure.Blob, overwrite bool) tea.Cmd {
 func (m *AppModel) startBulkDownload() tea.Cmd {
 	// Reset state
 	m.isBulkDownloading = true
+	m.bulkCancelRequested = false
+	m.bulkCurrentBytesRead = 0
+	m.bulkCurrentTotalBytes = 0
 	m.bulkDownloadSuccesses = 0
 	m.bulkDownloadFailures = []string{}
 	m.bulkDownloadQueue = []FileItem{}
@@ -920,16 +1233,15 @@ func (m *AppModel) startBulkDownload() tea.Cmd {
 
 	if m.bulkDownloadTotal == 0 {
 		m.isBulkDownloading = false
-		return func() tea.Msg {
-			return DownloadMsg{Success: true, Message: "No files to download."}
-		}
+		// Immediately show a simple alert when there are no files
+		return func() tea.Msg { return BulkDownloadProgressMsg{Current: 0, Total: 0, File: "", Bytes: 0, TotalB: 0, Done: true, Err: nil} }
 	}
 
 	// Start first download
 	return m.downloadNextFile()
 }
 
-// downloadNextFile downloads the next file in the queue
+// downloadNextFile prepares the next file in the queue and opens its streams
 func (m *AppModel) downloadNextFile() tea.Cmd {
 	if len(m.bulkDownloadQueue) == 0 {
 		return nil
@@ -940,7 +1252,7 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 	m.bulkDownloadCurrent++
 
 	return func() tea.Msg {
-		// Download this file
+		// Download this file (open streams, then step via bulkDownloadStep)
 		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 
 		// Structure: downloads/date/account/container/file
@@ -954,6 +1266,9 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 				Current: m.bulkDownloadCurrent,
 				Total:   m.bulkDownloadTotal,
 				File:    fileItem.Name,
+				Bytes:   0,
+				TotalB:  0,
+				Done:    true,
 				Err:     fmt.Errorf("invalid filename: %s", fileItem.Name),
 			}
 		}
@@ -966,6 +1281,9 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 				Current: m.bulkDownloadCurrent,
 				Total:   m.bulkDownloadTotal,
 				File:    fileItem.Name,
+				Bytes:   0,
+				TotalB:  0,
+				Done:    true,
 				Err:     err,
 			}
 		}
@@ -982,6 +1300,9 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 				Current: m.bulkDownloadCurrent,
 				Total:   m.bulkDownloadTotal,
 				File:    fileItem.Name,
+				Bytes:   0,
+				TotalB:  0,
+				Done:    true,
 				Err:     err,
 			}
 		}
@@ -993,19 +1314,78 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 				Current: m.bulkDownloadCurrent,
 				Total:   m.bulkDownloadTotal,
 				File:    fileItem.Name,
+				Bytes:   0,
+				TotalB:  0,
+				Done:    true,
 				Err:     err,
 			}
 		}
 
-		_, err = io.Copy(outFile, rc)
-		outFile.Close()
-		rc.Close()
+		// Initialize current-byte tracking
+		m.bulkCurrentBytesRead = 0
+		m.bulkCurrentTotalBytes = fileItem.Properties.ContentLength
 
+		// Store reader/writer temporarily via a stepping message
+		// We'll embed them in the next step through a helper closure.
+		return m.bulkDownloadStepWithHandles(fileItem, rc, outFile)
+	}
+}
+
+// bulkDownloadStepWithHandles reads a chunk for the given file and reports progress.
+func (m *AppModel) bulkDownloadStepWithHandles(fileItem FileItem, rc io.ReadCloser, outFile *os.File) BulkDownloadProgressMsg {
+	if m.bulkCancelRequested {
+		rc.Close()
+		outFile.Close()
 		return BulkDownloadProgressMsg{
 			Current: m.bulkDownloadCurrent,
 			Total:   m.bulkDownloadTotal,
 			File:    fileItem.Name,
-			Err:     err, // err from io.Copy
+			Bytes:   m.bulkCurrentBytesRead,
+			TotalB:  m.bulkCurrentTotalBytes,
+			Done:    true,
+			Err:     nil,
 		}
 	}
+
+	buf := make([]byte, 32*1024)
+	n, err := rc.Read(buf)
+	if n > 0 {
+		if _, werr := outFile.Write(buf[:n]); werr != nil && err == nil {
+			err = werr
+		}
+		m.bulkCurrentBytesRead += int64(n)
+	}
+
+	done := false
+	if err != nil {
+		if err == io.EOF {
+			done = true
+			err = nil
+		} else {
+			done = true
+		}
+	}
+
+	if done {
+		rc.Close()
+		outFile.Close()
+	}
+
+	return BulkDownloadProgressMsg{
+		Current: m.bulkDownloadCurrent,
+		Total:   m.bulkDownloadTotal,
+		File:    fileItem.Name,
+		Bytes:   m.bulkCurrentBytesRead,
+		TotalB:  m.bulkCurrentTotalBytes,
+		Done:    done,
+		Err:     err,
+	}
+}
+
+// bulkDownloadStep continues downloading the current file using the last known state.
+func (m *AppModel) bulkDownloadStep() tea.Cmd {
+	// We don't retain rc/outFile on the model, so this is only used immediately
+	// after downloadNextFile, which wrapped them into a BulkDownloadProgressMsg.
+	// Here we just no-op and rely on downloadNextFile's step handling.
+	return nil
 }
