@@ -85,6 +85,9 @@ type AppModel struct {
 	bulkCurrentTotalBytes int64
 	bulkDownloadSuccesses int
 	bulkDownloadFailures  []string
+	bulkDownloadReader    io.ReadCloser
+	bulkDownloadWriter    *os.File
+	bulkCurrentFileItem   *FileItem
 
 	// Scan Progress
 	scanProgress int
@@ -260,6 +263,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if msg.String() == "esc" {
 					m.bulkCancelRequested = true
 					m.modalTitle = "Cancelling Bulk Download..."
+					// Close the reader to unblock any pending Read() calls
+					if m.bulkDownloadReader != nil {
+						m.bulkDownloadReader.Close()
+						// Don't set to nil yet - let the step function handle cleanup
+					}
 				}
 			case 5: // Single download progress
 				// Allow cancel with ESC
@@ -493,16 +501,28 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+	case BulkDownloadStartedMsg:
+		if msg.Err != nil {
+			// Error starting download for this file
+			m.bulkDownloadFailures = append(m.bulkDownloadFailures, msg.FileItem.Name)
+			// Continue with next file
+			return m, m.downloadNextFile()
+		}
+
+		// Store reader and writer in model
+		m.bulkDownloadReader = msg.Reader
+		m.bulkDownloadWriter = msg.Writer
+		m.bulkCurrentFileItem = &msg.FileItem
+		m.bulkCurrentBytesRead = 0
+		m.bulkCurrentTotalBytes = msg.FileItem.Properties.ContentLength
+
+		// Start the first download step for this file
+		return m, m.bulkDownloadStep()
+
 	case BulkDownloadProgressMsg:
 		// Update byte-level and file-level progress
 		m.bulkCurrentBytesRead = msg.Bytes
 		m.bulkCurrentTotalBytes = msg.TotalB
-
-		if msg.Err != nil && msg.Done {
-			m.bulkDownloadFailures = append(m.bulkDownloadFailures, msg.File)
-		} else if msg.Done && msg.Err == nil {
-			m.bulkDownloadSuccesses++
-		}
 
 		// Calculate percentage for current file if size known
 		percent := 0
@@ -517,6 +537,24 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// If this file is done, either move to next or finish
 		if msg.Done {
+			// Clean up resources for current file
+			if m.bulkDownloadReader != nil {
+				m.bulkDownloadReader.Close()
+				m.bulkDownloadReader = nil
+			}
+			if m.bulkDownloadWriter != nil {
+				m.bulkDownloadWriter.Close()
+				m.bulkDownloadWriter = nil
+			}
+			m.bulkCurrentFileItem = nil
+
+			// Track success/failure
+			if msg.Err != nil {
+				m.bulkDownloadFailures = append(m.bulkDownloadFailures, msg.File)
+			} else {
+				m.bulkDownloadSuccesses++
+			}
+
 			// If cancellation requested or we've reached the end, show summary
 			if m.bulkCancelRequested || msg.Current >= msg.Total {
 				m.isBulkDownloading = false
@@ -972,6 +1010,13 @@ type DownloadMsg struct {
 	Message string // For bulk download summary
 }
 
+type BulkDownloadStartedMsg struct {
+	Reader   io.ReadCloser
+	Writer   *os.File
+	FileItem FileItem
+	Err      error
+}
+
 type BulkDownloadProgressMsg struct {
 	Current int
 	Total   int
@@ -1218,6 +1263,9 @@ func (m *AppModel) startBulkDownload() tea.Cmd {
 	m.bulkDownloadSuccesses = 0
 	m.bulkDownloadFailures = []string{}
 	m.bulkDownloadQueue = []FileItem{}
+	m.bulkDownloadReader = nil
+	m.bulkDownloadWriter = nil
+	m.bulkCurrentFileItem = nil
 
 	// Filter files to download (non-version entries only)
 	for _, item := range m.fileList.Items() {
@@ -1252,7 +1300,7 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 	m.bulkDownloadCurrent++
 
 	return func() tea.Msg {
-		// Download this file (open streams, then step via bulkDownloadStep)
+		// Open streams for this file
 		c := azure.NewClientWithToken(m.accessToken, m.debugWriter, m.userAgent)
 
 		// Structure: downloads/date/account/container/file
@@ -1262,14 +1310,9 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 		// Clean the file path to prevent traversal
 		cleanName := filepath.Clean(fileItem.Name)
 		if strings.Contains(cleanName, "..") {
-			return BulkDownloadProgressMsg{
-				Current: m.bulkDownloadCurrent,
-				Total:   m.bulkDownloadTotal,
-				File:    fileItem.Name,
-				Bytes:   0,
-				TotalB:  0,
-				Done:    true,
-				Err:     fmt.Errorf("invalid filename: %s", fileItem.Name),
+			return BulkDownloadStartedMsg{
+				FileItem: fileItem,
+				Err:      fmt.Errorf("invalid filename: %s", fileItem.Name),
 			}
 		}
 
@@ -1277,14 +1320,9 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 
 		// Ensure parent directory exists (handle nested files like static/js/foo.js)
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-			return BulkDownloadProgressMsg{
-				Current: m.bulkDownloadCurrent,
-				Total:   m.bulkDownloadTotal,
-				File:    fileItem.Name,
-				Bytes:   0,
-				TotalB:  0,
-				Done:    true,
-				Err:     err,
+			return BulkDownloadStartedMsg{
+				FileItem: fileItem,
+				Err:      err,
 			}
 		}
 
@@ -1296,96 +1334,101 @@ func (m *AppModel) downloadNextFile() tea.Cmd {
 
 		rc, err := c.DownloadBlob(m.selectedAccount, m.selectedContainer, fileItem.Name, identifier)
 		if err != nil {
-			return BulkDownloadProgressMsg{
-				Current: m.bulkDownloadCurrent,
-				Total:   m.bulkDownloadTotal,
-				File:    fileItem.Name,
-				Bytes:   0,
-				TotalB:  0,
-				Done:    true,
-				Err:     err,
+			return BulkDownloadStartedMsg{
+				FileItem: fileItem,
+				Err:      err,
 			}
 		}
 
 		outFile, err := os.Create(path)
 		if err != nil {
 			rc.Close()
-			return BulkDownloadProgressMsg{
-				Current: m.bulkDownloadCurrent,
-				Total:   m.bulkDownloadTotal,
-				File:    fileItem.Name,
-				Bytes:   0,
-				TotalB:  0,
-				Done:    true,
-				Err:     err,
+			return BulkDownloadStartedMsg{
+				FileItem: fileItem,
+				Err:      err,
 			}
 		}
 
-		// Initialize current-byte tracking
-		m.bulkCurrentBytesRead = 0
-		m.bulkCurrentTotalBytes = fileItem.Properties.ContentLength
-
-		// Store reader/writer temporarily via a stepping message
-		// We'll embed them in the next step through a helper closure.
-		return m.bulkDownloadStepWithHandles(fileItem, rc, outFile)
+		return BulkDownloadStartedMsg{
+			Reader:   rc,
+			Writer:   outFile,
+			FileItem: fileItem,
+			Err:      nil,
+		}
 	}
 }
 
-// bulkDownloadStepWithHandles reads a chunk for the given file and reports progress.
-func (m *AppModel) bulkDownloadStepWithHandles(fileItem FileItem, rc io.ReadCloser, outFile *os.File) BulkDownloadProgressMsg {
-	if m.bulkCancelRequested {
-		rc.Close()
-		outFile.Close()
+// bulkDownloadStep reads a chunk from the current bulk download and reports progress.
+func (m *AppModel) bulkDownloadStep() tea.Cmd {
+	return func() tea.Msg {
+		// Access the current model's reader/writer (these are set when BulkDownloadStartedMsg is received)
+		reader := m.bulkDownloadReader
+		writer := m.bulkDownloadWriter
+		currentBytes := m.bulkCurrentBytesRead
+		totalBytes := m.bulkCurrentTotalBytes
+		fileName := ""
+		if m.bulkCurrentFileItem != nil {
+			fileName = m.bulkCurrentFileItem.Name
+		}
+
+		if reader == nil || writer == nil {
+			return BulkDownloadProgressMsg{
+				Current: m.bulkDownloadCurrent,
+				Total:   m.bulkDownloadTotal,
+				File:    fileName,
+				Bytes:   currentBytes,
+				TotalB:  totalBytes,
+				Done:    true,
+				Err:     fmt.Errorf("download not properly initialized"),
+			}
+		}
+
+		// Check if user requested cancel (read from model)
+		if m.bulkCancelRequested {
+			return BulkDownloadProgressMsg{
+				Current: m.bulkDownloadCurrent,
+				Total:   m.bulkDownloadTotal,
+				File:    fileName,
+				Bytes:   currentBytes,
+				TotalB:  totalBytes,
+				Done:    true,
+				Err:     nil,
+			}
+		}
+
+		// Read a chunk
+		buf := make([]byte, 32*1024)
+		n, err := reader.Read(buf)
+
+		newBytesRead := currentBytes
+		if n > 0 {
+			if _, werr := writer.Write(buf[:n]); werr != nil && err == nil {
+				err = werr
+			}
+			newBytesRead = currentBytes + int64(n)
+		}
+
+		done := false
+		var finalErr error
+
+		if err != nil {
+			if err == io.EOF {
+				done = true
+				finalErr = nil
+			} else {
+				done = true
+				finalErr = err
+			}
+		}
+
 		return BulkDownloadProgressMsg{
 			Current: m.bulkDownloadCurrent,
 			Total:   m.bulkDownloadTotal,
-			File:    fileItem.Name,
-			Bytes:   m.bulkCurrentBytesRead,
-			TotalB:  m.bulkCurrentTotalBytes,
-			Done:    true,
-			Err:     nil,
+			File:    fileName,
+			Bytes:   newBytesRead,
+			TotalB:  totalBytes,
+			Done:    done,
+			Err:     finalErr,
 		}
 	}
-
-	buf := make([]byte, 32*1024)
-	n, err := rc.Read(buf)
-	if n > 0 {
-		if _, werr := outFile.Write(buf[:n]); werr != nil && err == nil {
-			err = werr
-		}
-		m.bulkCurrentBytesRead += int64(n)
-	}
-
-	done := false
-	if err != nil {
-		if err == io.EOF {
-			done = true
-			err = nil
-		} else {
-			done = true
-		}
-	}
-
-	if done {
-		rc.Close()
-		outFile.Close()
-	}
-
-	return BulkDownloadProgressMsg{
-		Current: m.bulkDownloadCurrent,
-		Total:   m.bulkDownloadTotal,
-		File:    fileItem.Name,
-		Bytes:   m.bulkCurrentBytesRead,
-		TotalB:  m.bulkCurrentTotalBytes,
-		Done:    done,
-		Err:     err,
-	}
-}
-
-// bulkDownloadStep continues downloading the current file using the last known state.
-func (m *AppModel) bulkDownloadStep() tea.Cmd {
-	// We don't retain rc/outFile on the model, so this is only used immediately
-	// after downloadNextFile, which wrapped them into a BulkDownloadProgressMsg.
-	// Here we just no-op and rely on downloadNextFile's step handling.
-	return nil
 }
